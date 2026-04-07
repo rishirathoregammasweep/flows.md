@@ -2,10 +2,6 @@
 
 This document explains **how incoming events lead to triggered campaigns** in Gamma Engage, and **what reads and writes** happen at each step—PostgreSQL, Redis, RabbitMQ, and external services. Trigger **definitions** are configuration in Postgres; they are **not** inserted when an event fires.
 
-**Related:** [End-to-end pipeline (ingest → queue → engine → outbound)](./triggers-end-to-end-pipeline.md) · [Campaign-engine triggers (shorter)](../services/campaign-engine/docs/triggers-and-event-flow.md) · [Quick reference](./triggers-pipeline-quick-reference.md)
-
----
-
 ## 1. Mental model
 
 1. An **event** describes something that happened for a player (deposit, login, bet, etc.).
@@ -28,7 +24,7 @@ flowchart LR
 
 ## 2. Before campaign-engine (for context)
 
-HTTP **event-ingestion** validates the envelope, enforces idempotency and rate limits, and publishes to **`ge.events.raw.v1`**. That phase touches **Redis** (idempotency, rate limits), **RabbitMQ**, and often **ClickHouse** for analytics. See [triggers-end-to-end-pipeline.md](./triggers-end-to-end-pipeline.md) Phase 1.
+HTTP **event-ingestion** validates the envelope, enforces idempotency and rate limits, and publishes to **`ge.events.raw.v1`**. That phase touches **Redis** (idempotency, rate limits), **RabbitMQ**, and often **ClickHouse** for analytics. The separate end-to-end pipeline doc covers that ingest phase in detail.
 
 The steps below start when **campaign-engine** consumes one message from **`ge.events.raw.v1`**.
 
@@ -36,7 +32,7 @@ The steps below start when **campaign-engine** consumes one message from **`ge.e
 
 ## 3. Step-by-step: one consumed event in campaign-engine
 
-Implementation: `EventConsumerService.processMessage` → `src/campaign/event-consumer.service.ts`.
+Implementation entrypoint: `EventConsumerService.processMessage`.
 
 ### Step A — Parse and validate
 
@@ -90,7 +86,7 @@ This is **not** the same as the `triggers` table; journeys are a separate automa
 
 ### Step F — Trigger evaluation
 
-`TriggerEvaluatorService.evaluate(envelope, playerState)` — `src/triggers/trigger-evaluator.service.ts`.
+`TriggerEvaluatorService.evaluate(envelope, playerState)`.
 
 #### F.1 Load trigger definitions
 
@@ -124,7 +120,7 @@ For each trigger, **all** conditions must pass (AND):
 
 Sequential logic (high level):
 
-- Wrong step order can **reset** (e.g. restart from step 1) or **wait** — see `evaluateSequence` in `trigger-evaluator.service.ts`.
+- Wrong step order can **reset** (e.g. restart from step 1) or **wait** — see `evaluateSequence` in the trigger evaluator service.
 - TTL on sequence keys: window seconds if configured, else **7 days** default.
 
 ---
@@ -206,17 +202,3 @@ sequenceDiagram
   end
   EC->>Q: ack
 ```
-
----
-
-## 6. Source files
-
-| Topic | Path |
-|-------|------|
-| Consumer orchestration | `services/campaign-engine/src/campaign/event-consumer.service.ts` |
-| Trigger evaluation + Redis sequences | `services/campaign-engine/src/triggers/trigger-evaluator.service.ts` |
-| Player state Redis | `services/campaign-engine/src/player-state/player-state.service.ts` |
-| Snapshots PG | `services/campaign-engine/src/snapshot/snapshot.service.ts` |
-| Conversions + delivery logs | `services/campaign-engine/src/conversions/conversion-tracker.service.ts` |
-| Outbound publish | `services/campaign-engine/src/campaign/campaign-publisher.service.ts` |
-| Segment membership for triggers | `services/campaign-engine/src/segmentation/segmentation.service.ts` |
