@@ -36,7 +36,7 @@ flowchart TB
     CTRL -->|no| TH[Throttle and policy checks]
     TH --> PROF[Load player contact]
     PROF --> RND[Render templates]
-    RND --> CH{channels[]}
+    RND --> CH{For each channel in payload}
     CH --> EMAIL[Email send]
     CH --> SMS[SMS send]
     EMAIL --> ESP[Email provider API]
@@ -267,7 +267,7 @@ sequenceDiagram
   opt sequential trigger
     TE->>R: GET/SETEX/DEL seq:...
   end
-  TE-->>EC: MatchedTrigger[]
+  TE-->>EC: MatchedTrigger results
   loop each match
     EC->>CP: publishCampaign
     CP->>PG: campaigns, ab_tests
