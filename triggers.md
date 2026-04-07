@@ -8,17 +8,46 @@ This document explains **how incoming events lead to triggered campaigns** in Ga
 2. **Triggers** tie an `event_type` (plus brand, conditions) to a **campaign** to send when rules pass.
 3. The **campaign-engine** consumes events from RabbitMQ, **updates ephemeral and durable state**, then **evaluates** triggers and **publishes** outbound campaign messages for each match.
 
-Runtime path (simplified):
+### End-to-end flow (event → campaign → outbound → email & SMS)
 
 ```mermaid
-flowchart LR
-  RMQ_IN[ge.events.raw.v1]
-  EC[EventConsumerService]
-  RMQ_IN --> EC
-  EC --> Redis[(Redis)]
-  EC --> PG[(PostgreSQL)]
-  EC --> RMQ_OUT[ge.campaigns outbound]
+flowchart TB
+  subgraph ingest["Ingest (optional context)"]
+    HTTP[HTTP POST /events]
+    HTTP --> RMQ_RAW[Queue ge.events.raw.v1]
+  end
+
+  subgraph engine["Campaign engine"]
+    EC[Consume event]
+    EC --> ST[Update player state and snapshots]
+    ST --> TR[Evaluate triggers]
+    TR --> PUB[Publish CampaignOutboundMessage]
+    ST -.-> Redis[(Redis)]
+    ST -.-> PG1[(PostgreSQL)]
+    TR -.-> PG1
+    PUB --> RMQ_OUT[ge.campaigns exchange, routing key campaigns.outbound.v1]
+    RMQ_OUT --> Q_OUT[Queue ge.campaigns.outbound]
+  end
+
+  subgraph delivery["Channel delivery"]
+    CD[Consume outbound message]
+    CD --> CTRL{Control group?}
+    CTRL -->|yes| SKIP[Skip real send]
+    CTRL -->|no| TH[Throttle and policy checks]
+    TH --> PROF[Load player contact]
+    PROF --> RND[Render templates]
+    RND --> CH{channels[]}
+    CH --> EMAIL[Email send]
+    CH --> SMS[SMS send]
+    EMAIL --> ESP[Email provider API]
+    SMS --> SMSP[SMS provider API]
+  end
+
+  RMQ_RAW --> EC
+  Q_OUT --> CD
 ```
+
+**Notes:** Ingest publishes to **`ge.events.raw.v1`**; the engine does not receive HTTP directly. **`channels`** on the outbound payload lists which channels to use (e.g. `email`, `sms`). **Channel-delivery** may send them **concurrently** or **waterfall** (first success wins) depending on `waterfall`. Control-group messages are published but **no real email/SMS** is sent.
 
 ---
 
@@ -163,7 +192,54 @@ Control-group players still get a message with `is_control_group: true`; downstr
 
 ---
 
-## 5. Diagram: storage-aware sequence
+## 5. End-to-end sequence (raw event → outbound → email & SMS)
+
+Shows the **cross-service** path after an event is on the bus. Campaign-engine internal storage details are in section 6.
+
+```mermaid
+sequenceDiagram
+  participant RAW as ge.events.raw.v1
+  participant CE as Campaign engine
+  participant R as Redis
+  participant PG as PostgreSQL
+  participant OUT as ge.campaigns.outbound
+  participant CD as Channel delivery
+  participant PP as Player profile API
+  participant EM as Email service
+  participant SM as SMS service
+
+  RAW->>CE: event envelope JSON
+  CE->>R: merge player_state
+  CE->>PG: snapshots, conversions, journeys (as applicable)
+  CE->>CE: trigger evaluation
+  CE->>OUT: publish per matched trigger
+  CE->>RAW: ack event
+
+  OUT->>CD: deliver message
+  alt is_control_group
+    CD->>CD: suppress real delivery
+  else live send path
+    CD->>CD: throttle, suppression, contact policy
+    CD->>PP: resolve email / phone
+    CD->>CD: render templates, tracking links
+    par email path
+      CD->>EM: send if channel in list
+      EM-->>CD: result
+    and sms path
+      CD->>SM: send if channel in list
+      SM-->>CD: result
+    end
+  end
+  CD->>OUT: ack
+```
+
+**Skips and branches:** If the player is in the **control group**, channel-delivery returns after logging suppression—**no** calls to email/SMS providers. **Throttle**, **opt-out** (`allow_email` / `allow_sms`), and missing contact details can skip one or both channels without failing the whole message (per channel). With **`waterfall: true`**, channels are tried **in order** until one succeeds; the diagram shows the usual **parallel** path when `waterfall` is false and both `email` and `sms` appear in `channels`.
+
+---
+
+## 6. Campaign-engine sequence (storage-focused)
+
+Same pipeline as section 5, zoomed into **campaign-engine** only: Redis, Postgres, and the outbound publish.
 
 ```mermaid
 sequenceDiagram
