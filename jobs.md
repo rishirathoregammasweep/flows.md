@@ -1,143 +1,158 @@
-# Background jobs with BullMQ (instead of NestJS Cron)
+# Workflow engine: schedules, campaigns, journeys, webhooks
 
-This document describes how **cdp-app** could move recurring work from **`@nestjs/schedule`** (`ScheduleModule`, `@Cron`) to **BullMQ**, so you get **durable queues**, **retries**, **horizontal workers**, and **workflow-style job graphs** on top of **Redis** (the stack already uses **ioredis** for throttling and caching).
+Conceptual flow diagrams for a **workflow engine** that coordinates **many scheduled campaigns** (cron or one-shot), a **repeatable campaign queue**, **journey steps**, and **outbound webhooks**. This aligns with ideas in **cdp-app** (`scheduled_campaigns`, `cron_expr`, journey enrollments / steps) and with a **BullMQ-style** orchestration layer described in [background-jobs-bullmq.md](./background-jobs-bullmq.md).
 
-It is a design and migration guide, not an implemented change.
-
----
-
-## 1. What you have today
-
-Across **cdp-app**, several modules register **`ScheduleModule`** and run work on **`@Cron`** decorators, for example:
-
-- **Campaign engine** — journey execution tick (`EVERY_MINUTE`)
-- **Channel delivery** — delivery retry sweep (`EVERY_MINUTE`)
-- **Lifecycle engine** — nightly-style windows
-- **Analytics** — RFM (`EVERY_DAY_AT_2AM`)
-- **Data connector** — S3 / SFTP pollers (env-driven cron expressions)
-- **Tenant admin** — DLQ alerts (`EVERY_MINUTE`)
-
-Those jobs run **inside whichever Nest process(es) are up**. They are **not** centrally deduplicated: with **multiple replicas**, **every instance** runs the same cron unless you add distributed locks or leader election yourself.
+These diagrams are **target architecture**; wiring may use BullMQ flows, separate queues, or a mix.
 
 ---
 
-## 2. Why BullMQ instead of in-process cron
+## 1. End-to-end engine (schedules → campaigns → channels & webhooks)
 
-| Concern | Nest `@Cron` | BullMQ |
-|--------|----------------|--------|
-| **Multi-instance** | Each pod fires; needs extra locking | **One scheduler** (or Redis-coordinated repeat) drives work; **workers** scale out safely |
-| **Persistence** | Lost if process dies mid-run | Jobs live in **Redis** until completed / failed |
-| **Retries / backoff** | Manual | Built-in **attempts**, **exponential backoff**, **stall** handling |
-| **Visibility** | Logs only | **Bull Board** / metrics on queue depth, failures, latency |
-| **Delay & workflows** | Awkward | **Delayed jobs**, **repeatable jobs**, **flows** (parent → children) |
+High-level control plane: one **orchestrator** tick (or repeatable Redis job) fans out work without duplicating cron on every API replica.
 
-BullMQ is **not** a full BPMN engine, but it is enough for **“run this on a schedule”**, **“retry this unit of work”**, and **“step A then parallel B/C then D”** patterns.
+```mermaid
+flowchart TB
+  subgraph inputs["Definitions (per brand_id)"]
+    SC1["Scheduled campaign #1<br/>cron_expr / run_at"]
+    SC2["Scheduled campaign #2"]
+    SCN["Scheduled campaign #N"]
+    JV["Journeys + journey_steps<br/>(send / wait / condition)"]
+  end
 
----
+  subgraph engine["Workflow engine"]
+    ORCH["Orchestrator tick<br/>(single leader or BullMQ repeat)"]
+    RQ[("Repeatable campaign queue<br/>Redis / BullMQ")]
+    ORCH --> RQ
+    RQ --> DUE{"What is due?"}
+  end
 
-## 3. Building blocks (mental model)
+  subgraph schedule_path["Scheduled campaigns"]
+    DUE -->|"next fire for cron"| SCH_JOB["Job: executeSchedule<br/>brand_id + schedule_id"]
+    SCH_JOB --> DISPATCH["Segment resolve +<br/>dispatch to players"]
+  end
 
-1. **Connection** — Redis URL / options (reuse the same Redis you trust for job data; consider a **logical DB index** or **key prefix** so job keys do not collide with cache keys).
-2. **Queue** — named pipe of jobs (e.g. `campaign-journey-tick`, `delivery-retry`).
-3. **Producer** — Nest service (or any script) that **`add()`**s jobs with optional **repeat**, **delay**, or **priority**.
-4. **Worker** — process that **pulls** jobs and runs your handler. Can live **in the same Nest app** as the API (simple) or in **dedicated worker** deployments (recommended under load).
-5. **Scheduler / repeatable jobs** — BullMQ can register **cron-like repeat** so Redis triggers the next enqueue; only **workers** execute handlers.
+  subgraph journey_path["Journeys"]
+    DUE -->|"next_step_at elapsed"| JR_JOB["Job: advance enrollment<br/>brand_id + enrollment_id"]
+    JR_JOB --> STEP_EXEC["Execute current step"]
+  end
 
-Optional: **QueueEvents** for metrics, alerting, or fan-out without blocking the worker.
+  subgraph delivery["Outbound"]
+    DISPATCH --> PUB["Campaign publisher<br/>(e.g. AMQP → channel delivery)"]
+    STEP_EXEC -->|"step_type = send"| PUB
+    PUB --> CH["Channels<br/>email / sms / push / …"]
+    PUB --> WHQ[("Webhook out queue")]
+    WHQ --> WH["HTTP webhooks<br/>delivery / analytics callbacks"]
+  end
 
----
+  subgraph journey_control["Journey step logic"]
+    STEP_EXEC -->|"step_type = wait"| DELAY["Enqueue delayed job<br/>(delay_hours)"]
+    DELAY --> RQ
+    STEP_EXEC -->|"step_type = condition"| BR{"Condition met?"}
+    BR -->|"yes"| NEXT["Advance step_order"]
+    BR -->|"no"| EXIT["Mark enrollment exited"]
+    NEXT --> RQ
+  end
 
-## 4. Replacing `@Cron` with scheduled BullMQ jobs
+  SC1 & SC2 & SCN -.->|"persisted config"| DUE
+  JV -.->|"enrollments + steps"| STEP_EXEC
+```
 
-**Pattern A — Repeatable job on a dedicated queue**
+**Reading the diagram**
 
-- Create a queue, e.g. `lifecycle-nightly`.
-- On application bootstrap (or a one-off migration command), **register** a job with a **repeat rule** (cron pattern), same spirit as `@Cron('30 3 * * *')`.
-- A **single worker** (or N workers for throughput) processes each firing; use **job id** or **deduplication** options if you must guarantee at-most-once side effects per window.
-
-**Pattern B — External cron → enqueue**
-
-- Keep **Kubernetes CronJob** / system cron that **HTTP POSTs** or runs **`node enqueue.js`** to add a one-off job. Useful when ops wants scheduling outside the app.
-
-**Pattern C — “Tick” queue fed every minute**
-
-- Replace `EVERY_MINUTE` crons with a **repeat every 60s** (or a short cron) on a **`system-tick`** queue; handlers stay small and enqueue **child jobs** per tenant or per batch (avoids one giant cron method).
-
-Map existing env-driven crons (e.g. S3/SFTP poll intervals) to **repeat patterns** or **dynamic repeat** updated when config changes.
-
----
-
-## 5. One-off and delayed jobs
-
-Not everything is cron-shaped:
-
-- **Send in 10 minutes** — `add` with **delay** (ms).
-- **Retry this delivery in 5 minutes** — prefer a **delayed job** (or dedicated **retry queue** with backoff) over a tight `@Cron` loop that scans the database every minute.
-
-This aligns well with **channel delivery retries** and similar patterns.
-
----
-
-## 6. Workflows (multi-step, fan-out, join)
-
-BullMQ supports **Flows** (**parent job** with **child jobs** on the same or different queues):
-
-- **Fan-out** — parent job completes “planning”; **FlowProducer** adds children (e.g. one job per **brand_id** or per batch of players).
-- **Fan-in** — parent can use **“wait for children”** semantics so a final step runs only when children finish (see BullMQ docs for the current **FlowProducer** / **parent dependency** API in your version).
-
-**Simpler alternative** — **chain by enqueueing**: step-1 worker finishes and adds step-2 job with payload. Easier to reason about; less magic than flows.
-
-**When to reach for something else** — Long-running **Saga** across days, human approvals, or complex compensation may fit **Temporal** / **Camunda** better; BullMQ fits **minutes-scale** background work inside your own Redis.
+- **Many schedules** map to **many repeatable jobs** (one job key per `schedule_id`, or one scanner job that loads all due rows from Postgres).
+- **Journey** work is either the same tick scanning **`journey_enrollments`** (`status`, `next_step_at`) or **per-enrollment delayed jobs** after a **wait** step (cleaner than polling only on a minute cron).
+- **Webhooks** are modeled as a **dedicated queue** so HTTP retries, backoff, and dead-lettering do not block campaign send or journey advancement.
 
 ---
 
-## 7. NestJS integration (sketch)
+## 2. Repeatable campaign queue vs one-shot
 
-Typical packages:
+```mermaid
+flowchart LR
+  subgraph definitions
+    CRON["cron_expr set<br/>(e.g. 0 9 * * 1)"]
+    ONCE["run_at only<br/>(one-shot)"]
+  end
 
-- **`bullmq`** — core library.
-- **`@nestjs/bullmq`** — registers queues and workers with Nest DI (check compatibility with your Nest **10.x**).
+  subgraph repeatable_campaign_queue
+    REP["Repeatable job<br/>pattern = cron_expr"]
+    ONESHOT["Delayed job<br/>run_at - now"]
+  end
 
-Suggested layout:
+  CRON --> REP
+  ONCE --> ONESHOT
 
-1. **`BullModule.forRootAsync`** — Redis connection from `ConfigService` (host, port, password, TLS, **prefix**).
-2. **`BullModule.registerQueue({ name: 'delivery-retry' })`** per domain queue.
-3. **`@Processor('delivery-retry')`** class with `@Process()` methods — replaces the body of today’s `@Cron` handler.
-4. **Bootstrap** — register repeatable jobs once (guarded by env flag or **idempotent** `upsertJobScheduler` / remove-duplicates pattern depending on BullMQ version).
-5. **Shutdown** — close workers and queues in **`onModuleDestroy`** so in-flight jobs are not cut off abruptly (BullMQ exposes **graceful** close options).
+  REP --> EX["executeSchedule"]
+  ONESHOT --> EX
+  EX -->|"cron: reset status pending"| REP
+  EX -->|"one-shot"| DONE["status completed"]
+```
 
-Keep **heavy** work off the HTTP event loop: the **worker** concurrency setting controls parallelism.
-
----
-
-## 8. Operations and safety
-
-- **Idempotency** — Scheduled ticks often overlap with restarts; design handlers so **running twice** for the same window is safe (unique keys, `ON CONFLICT`, or “lease” row in Postgres).
-- **Redis memory** — Configure **TTL / removeOnComplete** / **removeOnFail** policies so finished jobs do not fill Redis.
-- **Tenancy** — Pass **`brand_id`** (or tenant id) in **job data**; workers resolve `TenantDataSourceService` the same way HTTP handlers do.
-- **Observability** — Structured logs with **job id**, **queue name**, **attempt**; optional **OpenTelemetry** + BullMQ instrumentation if you add it later.
-
----
-
-## 9. Migration checklist (incremental)
-
-1. Add **Redis-backed** BullMQ module to **cdp-app** (or split **worker** app later).
-2. Pick **one** low-risk cron (e.g. a poller or a metrics sweep), implement **queue + worker**, run **repeat** only in **one** environment first.
-3. Compare **duplication** and **missed runs** vs old `@Cron` under **multiple replicas**.
-4. Turn off the old **`@Cron`** for that path behind a feature flag.
-5. Repeat for **delivery retry**, **journey executor**, **DLQ alert**, **RFM**, etc., possibly **consolidating** several minute ticks into one scheduler queue that dispatches child jobs.
-
-You can keep **`ScheduleModule`** for a while for stragglers; the goal is **no duplicate fire** across instances and **clear** job lifecycle semantics.
+This mirrors **`ScheduledCampaignEntity`**: `cron_expr` takes precedence over `run_at`; after a successful cron run, schedule stays **pending** for the next occurrence.
 
 ---
 
-## 10. References
+## 3. Journey: steps as a small state machine
 
-- [BullMQ — Guide](https://docs.bullmq.io/)
-- [BullMQ — Repeatable / scheduled jobs](https://docs.bullmq.io/guide/jobs/repeatable)
-- [BullMQ — Flows (parent / child)](https://docs.bullmq.io/guide/flows)
-- Nest: **`@nestjs/bullmq`** module documentation for your Nest major version
+```mermaid
+stateDiagram-v2
+  [*] --> DueCheck: enrollment active
+
+  DueCheck --> SendStep: step_type = send
+  DueCheck --> WaitStep: step_type = wait
+  DueCheck --> CondStep: step_type = condition
+
+  SendStep --> Publish: publish campaign / channels
+  Publish --> WebhookNotify: optional webhook job
+  WebhookNotify --> Advance
+
+  WaitStep --> ScheduleWait: enqueue delayed job delay_hours
+  ScheduleWait --> Advance
+
+  CondStep --> Evaluate: compare condition_field
+  Evaluate --> Advance: condition met
+  Evaluate --> Exited: condition not met
+
+  Advance --> Completed: no next step
+  Advance --> DueCheck: more steps, update next_step_at
+
+  Exited --> [*]
+  Completed --> [*]
+```
 
 ---
 
-*Last updated: internal design note for GammaEngage **cdp-app**.*
+## 4. Optional: sequence — schedule fire to webhook
+
+```mermaid
+sequenceDiagram
+  participant R as Repeatable queue (Redis)
+  participant W as Worker / campaign-engine
+  participant DB as Tenant Postgres
+  participant Q as Message bus (AMQP)
+  participant CD as Channel delivery
+  participant WH as Webhook worker
+
+  R->>W: job(schedule_id, brand_id)
+  W->>DB: load scheduled_campaigns + campaign
+  W->>DB: resolve segment → player list / batches
+  loop batches
+    W->>Q: publish send commands
+    Q->>CD: deliver email/sms/…
+    W->>R: enqueue webhook_out(delivery_summary)
+  end
+  R->>WH: job(webhook URL, payload, attempt)
+  WH-->>WH: HTTP POST + retry/backoff
+```
+
+---
+
+## 5. Implementation notes (short)
+
+- **Idempotency** — Use stable **job ids** (`schedule_id` + fire window, or `enrollment_id` + `step_order`) so duplicates after deploy do not double-send.
+- **Fan-out** — BullMQ **FlowProducer**: parent “run schedule” → children “batch 1…k” → optional “aggregate + webhook” child (see BullMQ flows docs).
+- **Separation** — Keep **orchestration** (what runs when) in the workflow engine; keep **content** (templates, segments) in tenant DB; keep **HTTP webhooks** on an isolated queue with strict timeouts.
+
+---
+
+*See also: [background-jobs-bullmq.md](./background-jobs-bullmq.md), campaign-engine `SchedulerService`, `JourneyExecutorService`, `JourneyStepEntity`.*
