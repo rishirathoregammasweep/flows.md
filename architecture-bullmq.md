@@ -45,6 +45,86 @@ BullMQ wiring details: `docs/journey-scheduled-campaign-architecture-changes.md`
 
 ---
 
+## BullMQ: Job Scheduler vs Queue
+
+Both are needed, but for different responsibilities:
+
+- **Job Scheduler** (`upsertJobScheduler`, BullMQ 5+) is for **time pattern registration** (e.g. cron-like `cron_expr`). It stores scheduler metadata in Redis and creates new job instances at each tick.
+- **Queue jobs** (`queue.add`) are for **actual executable work**. They can be immediate or delayed (`delay`), retried (`attempts` / backoff), and consumed by workers.
+
+Recommended usage in GammaEngage:
+
+| Need | BullMQ primitive | Example |
+|------|------------------|---------|
+| Repeating schedule definition | `upsertJobScheduler` on scheduler queue | Scheduled campaign with `cron_expr` |
+| One-shot future execution | `queue.add` with `delay` and stable `jobId` | `run_at` campaign send |
+| Journey step wake-up | `queue.add` with `delay` from `next_step_at` | `journey-advance` per enrollment |
+| Heavy fan-out / parallel work | `queue.add` to worker queues | batch dispatch, workflow queue |
+
+Practical rule:
+
+- Use **Job Scheduler** to answer: *“When should jobs be created repeatedly?”*
+- Use **Queue jobs** to answer: *“What unit of work should a worker execute now/later?”*
+
+---
+
+## Shared `bullmqProvider` (cross-service)
+
+To avoid each feature creating its own Redis/queue wiring, define a shared BullMQ provider module used by campaign scheduler and journeys.
+
+### What should be shared
+
+- **Single Redis connection factory** (host, TLS, db, prefix, retries).
+- **Queue factory / registry** for known queues (`campaign-cron`, `scheduled-campaign-run`, `journey-advance`, optional workflow queues).
+- **Common default job options** (`removeOnComplete`, `attempts`, backoff, `stackTraceLimit`).
+- **Helper APIs** for scheduler upsert/remove and delayed add with deterministic IDs.
+- **Lifecycle hooks** to close queues/workers cleanly on shutdown.
+
+### Suggested shape
+
+- `cdp-app/src/shared/bullmq/bullmq.module.ts`
+- `cdp-app/src/shared/bullmq/bullmq.provider.ts`
+- `cdp-app/src/shared/bullmq/bullmq.types.ts`
+
+### Provider contract (example)
+
+```ts
+export interface BullmqProvider {
+  queues: {
+    campaignCron: Queue;
+    scheduledCampaignRun: Queue;
+    journeyAdvance: Queue;
+  };
+  upsertRecurring(input: {
+    queue: Queue;
+    schedulerId: string;
+    pattern: string;
+    payload: Record<string, unknown>;
+  }): Promise<void>;
+  addDelayed(input: {
+    queue: Queue;
+    name: string;
+    jobId: string;
+    delayMs: number;
+    payload: Record<string, unknown>;
+  }): Promise<void>;
+  removeRecurring(input: { queue: Queue; schedulerId: string }): Promise<void>;
+}
+```
+
+### How features consume it
+
+- **`SchedulerService`** injects shared provider, then:
+  - recurring schedule → `upsertRecurring(...)`
+  - one-shot `run_at` → `addDelayed(...)`
+- **`JourneyService` / journey worker** injects the same provider:
+  - first enrollment wake-up → `addDelayed(...)`
+  - post-step continuation → `addDelayed(...)` for next step
+
+This keeps all BullMQ operational behavior (Redis options, retries, prefixes, queue names, shutdown) centralized and consistent across features.
+
+---
+
 ## Sequence: scheduler registration → each tick → handler → optional fan-out
 
 The flow below matches BullMQ’s model: something **registers** a repeatable scheduler on a queue; **Redis** stores scheduler metadata; on each match BullMQ **materializes a new job**; a **worker** runs the **Nest `@Process` (or equivalent) handler**, which may enqueue downstream jobs.
