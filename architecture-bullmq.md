@@ -97,6 +97,39 @@ On **create / update** of `scheduled_campaigns` (and on **activate / deactivate*
 
 - **`scheduled_campaign_runs`** (pending → running → done/failed) for audit and **replay** if Redis is lost.
 
+### 4.7 Sequence: schedule registration → each run (BullMQ)
+
+Same shape as a **CLI / deploy script** registering a repeatable scheduler: something **upserts** the BullMQ scheduler; **Redis** stores metadata; on each pattern match a **new job instance** hits the **worker** `@Process` handler, which may **fan out** to other queues instead of doing all work inline.
+
+**Repeatable (`cron_expr`):** use BullMQ’s **repeatable / job scheduler** API (e.g. **`upsertJobScheduler`** on the queue, BullMQ 5+) with a stable **`jobId`** per `schedule_id`. **One-off (`run_at`):** use **`Queue.add`** with **`delay`** (and a stable **`jobId`** for `sched-once:{id}`) instead of a repeat scheduler.
+
+```mermaid
+sequenceDiagram
+  participant CLI as CLI / deploy sync / Admin API
+  participant CQ as BullMQ queue scheduled-campaign-run
+  participant Redis as Redis
+  participant W as Worker scheduled-campaign-run
+  participant H as @Process handler executeSchedule
+  participant DB as Tenant Postgres
+  participant OQ as Other queues optional e.g. batch-dispatch
+
+  CLI->>CQ: upsertJobScheduler repeat pattern jobId sched schedule_id
+  CQ->>Redis: persist scheduler + repeat metadata
+  loop Each cron tick
+    Redis->>CQ: new job instance brand_id schedule_id
+    CQ->>W: deliver job
+    W->>H: run handler
+    H->>DB: load scheduled_campaigns campaigns update status last_run
+    H->>OQ: optional add fan-out work per segment batch
+  end
+```
+
+**Reading it**
+
+- **CLI / API** is any writer that reacts to **DB changes** or **release deploy** (sync all schedules from tenant DBs).
+- **`scheduled-campaign-run`** is both where you **register** the scheduler (queue API) and where **runnable jobs** land for workers (same queue name in typical BullMQ setups).
+- **`OQ`** is optional: e.g. one job per **N players** for backpressure, or keep today’s model and publish **directly to AMQP** inside **`H`** until you split.
+
 ---
 
 ## 5. Journeys — required changes
