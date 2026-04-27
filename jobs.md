@@ -88,6 +88,123 @@ You **do not** need: a separate workflow SaaS, GraphQL rewrites, or **schema-per
 
 ---
 
+## 8. BullMQ target flows (diagrams)
+
+Shared queue name examples: `scheduled-campaign-run`, `triggered-campaign-run`, `journey-advance`. Use a **Redis key prefix** and **`jobId`** / **outbox** as in §3 and §5.
+
+### 8.1 Scheduled campaign — one-off vs repeatable
+
+When **`scheduled_campaigns`** is created or updated (`is_active`), the app **registers** the right BullMQ shape. **`cron_expr`** wins over **`run_at`** (same as today’s entity semantics).
+
+```mermaid
+flowchart TB
+  subgraph api["Admin / API"]
+    SAVE["Upsert scheduled_campaigns<br/>brand_id, campaign_id, cron_expr | run_at"]
+  end
+
+  SAVE --> CHK{"Which schedule?"}
+
+  CHK -->|"run_at only, no cron"| ONE["BullMQ: add delayed job<br/>delay = run_at - now"]
+  CHK -->|"cron_expr set"| REP["BullMQ: upsert repeatable job<br/>pattern = cron_expr<br/>jobId = sched:{schedule_id}"]
+
+  ONE --> QSC[("Queue: scheduled-campaign-run")]
+  REP --> QSC
+
+  QSC --> WRK["Worker: executeSchedule<br/>load segment, dispatch"]
+  WRK --> DB[("Tenant DB: status, last_run_at")]
+  WRK --> PUB["Publisher / channel pipeline"]
+
+  WRK -->|"one-shot done"| DONE["Row status completed"]
+  WRK -->|"cron: next fire"| REP
+```
+
+**Implementation notes**
+
+- **Repeatable:** one stable **`jobId`** per `schedule_id` so updates **replace** the repeat definition instead of stacking duplicates.
+- **One-off:** single delayed job; on success mark **`completed`**; no repeat registration.
+- **Hybrid cron + legacy row:** if you still persist `next_run` in DB, BullMQ is the **wake timer**; DB remains **audit** and **segment** source.
+
+---
+
+### 8.2 Triggers — same configured event → run campaign (BullMQ)
+
+Goal: when an **event** matches **trigger configuration** (same `brand_id`, conditions, campaign), **enqueue** execution instead of doing everything synchronously in the event consumer.
+
+```mermaid
+flowchart TB
+  subgraph ingress["Event path"]
+    EVT["Validated event envelope<br/>brand_id, event_type, event_id, player_id"]
+  end
+
+  EVT --> QEV[("Queue: campaign-events<br/>jobId = event_id dedupe")]
+  QEV --> WEV["Worker: update player state<br/>optional: match triggers in DB"]
+
+  WEV --> MATCH{"Trigger row matches?<br/>event_type + conditions"}
+  MATCH -->|"no"| SKIP["Complete job"]
+  MATCH -->|"yes, campaign C"| QTR[("Queue: triggered-campaign-run<br/>jobId = hash brand + C + event_id")]
+
+  QTR --> WTR["Worker: build audience / publish<br/>idempotent send for this trigger firing"]
+  WTR --> PUB2["Campaign publisher"]
+  WTR --> DBT[("Tenant DB: optional trigger_fires / outbox row")]
+
+  subgraph optional["Optional split"]
+    WEV --> QJR["journey-on-event queue<br/>see workflow-engine doc"]
+  end
+```
+
+**Implementation notes**
+
+- **`triggered-campaign-run`** carries `{ brand_id, trigger_id, campaign_id, player_id, event_id }` (exact fields match your schema).
+- **Dedupe** is critical: same event redelivered must not create **two** sends — **`jobId`** + DB unique on `(event_id, trigger_id)` or equivalent.
+- **Heavy evaluation** (AI, large segments) can stay in **`campaign-events`** worker or move to **`triggered-campaign-run`** with **smaller** fan-out jobs per player batch.
+
+---
+
+### 8.3 Journey — `run_at` / `wait` / `next_step_at` via BullMQ
+
+Replace **minute cron polling** of **`journey_enrollments`** with **explicit delayed jobs** for “wake at T”, and **immediate jobs** for steps that run now. **Completion** is when there is **no next step** after a successful advance.
+
+```mermaid
+flowchart TB
+  subgraph enroll["Entry (event or API)"]
+    E1["enrollFromEvent / enroll API"]
+    E1 --> INS["INSERT journey_enrollments<br/>current_step, next_step_at"]
+  end
+
+  INS --> T0{"When is step 1 due?"}
+
+  T0 -->|"next_step_at <= now"| QNOW[("Queue: journey-advance<br/>immediate job")]
+  T0 -->|"wait / delay_hours > 0"| QDEL["BullMQ add delayed job<br/>delay_ms = hours * 3600 * 1000<br/>jobId = enroll:{id}:step:{n}"]
+
+  QDEL --> QNOW
+
+  QNOW --> WADV["Worker: load step by current_step"]
+  WADV --> STYPE{"step_type"}
+
+  STYPE -->|"send"| SEND["Publish journey step campaign"]
+  STYPE -->|"condition"| COND{"Met?"}
+  STYPE -->|"wait"| WAIT["Persist next_step_at<br/>enqueue delayed journey-advance"]
+
+  COND -->|"no"| EXIT["status exited"]
+  COND -->|"yes"| NEXT
+  SEND --> NEXT["Increment step or mark completed"]
+
+  NEXT --> MORE{"Next step exists?"}
+  MORE -->|"yes"| QNEXT["Enqueue journey-advance<br/>immediate or delayed from next step delay"]
+  MORE -->|"no"| CMP["status completed"]
+
+  QNEXT --> QDEL
+  WAIT --> QDEL
+```
+
+**Mapping to current model**
+
+- **`delay_hours`** on **`journey_steps`** → BullMQ **`delay`** on the **next** `journey-advance` job (same as a **`wait_till`** / **`run_at`** for that step boundary).
+- **`next_step_at`** in DB stays the **source of truth** for reporting; the **job** is the **timer** that wakes the worker.
+- **Condition exit** does not enqueue a follow-up; **send** then **advance** enqueues the **next** job only if a row with higher **`step_order`** exists.
+
+---
+
 ## Suggested migration order (summary)
 
 | Order | Change | Leverage |
@@ -102,4 +219,5 @@ You **do not** need: a separate workflow SaaS, GraphQL rewrites, or **schema-per
 
 ---
 
-*Internal guidance for GammaEngage **cdp-app** and tenant Postgres. Adjust table names (`scheduled_campaigns`, `journey_enrollments`, …) to match implementation as outbox tables are introduced.*
+*Internal guidance for GammaEngage **cdp-app** and tenant Postgres. Adjust table names (`scheduled_campaigns`, `journey_enrollments`, …) to match implementation as outbox tables are introduced. Flow diagrams: **§8**.*
+
