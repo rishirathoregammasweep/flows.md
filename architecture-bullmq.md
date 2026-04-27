@@ -23,7 +23,7 @@ BullMQ wiring details: `docs/journey-scheduled-campaign-architecture-changes.md`
 |--------|-------------|
 | Each API replica can run the same cron unless operations constrain replicas | **Repeat schedulers** and **job instances** are coordinated via **Redis**; workers scale horizontally |
 | Timers are **lost on restart** until `reloadAllCronJobs` runs; no built-in retries | Jobs **persist** until completed/failed; **retries**, backoff, and stall handling are first-class |
-| Long `executeSchedule` (segment fetch + AMQP) runs inside a timer callback | Thin **Nest Process** handler can **fan out** to dedicated queues for heavy or parallel work |
+| Long `executeSchedule` (segment fetch + AMQP) runs inside a timer callback | Thin **@Process** handler can **fan out** to dedicated queues for heavy or parallel work |
 | Journey **`next_step_at`** only checked **once per minute**; `isRunning` skips overlapping ticks | **Delayed `add()`** aligns wake-up with `next_step_at`; no global “whole executor” lock for all tenants |
 
 ---
@@ -55,7 +55,7 @@ sequenceDiagram
   participant CQ as BullMQ cron-queue
   participant Redis as Redis
   participant W as Worker (cron-queue)
-  participant H as @Process handler
+  participant H as Nest processor handler
   participant OQ as Other queues (e.g. workflow-queue)
 
   CLI->>CQ: upsertJobScheduler (repeat pattern)
@@ -96,11 +96,11 @@ flowchart TB
     JQ[journey-advance queue]
     RD[(Redis)]
     WK[Worker]
-    PR[@Process handler one step]
+    PR["Processor handler (one step)"]
   end
 
   subgraph outbound["Side effects"]
-    MQ[RabbitMQ ge.campaigns.outbound]
+    MQ["RabbitMQ ge.campaigns.outbound"]
   end
 
   EV --> EN
@@ -132,7 +132,7 @@ sequenceDiagram
   participant JQ as journey-advance queue
   participant Redis as Redis
   participant W as Worker journey-advance
-  participant H as @Process handler
+  participant H as Nest processor handler
   participant AMQP as RabbitMQ outbound
 
   Src->>JS: enrollFromEvent or manual enroll
