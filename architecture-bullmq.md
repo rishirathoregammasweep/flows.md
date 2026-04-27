@@ -23,7 +23,7 @@ BullMQ wiring details: `docs/journey-scheduled-campaign-architecture-changes.md`
 |--------|-------------|
 | Each API replica can run the same cron unless operations constrain replicas | **Repeat schedulers** and **job instances** are coordinated via **Redis**; workers scale horizontally |
 | Timers are **lost on restart** until `reloadAllCronJobs` runs; no built-in retries | Jobs **persist** until completed/failed; **retries**, backoff, and stall handling are first-class |
-| Long `executeSchedule` (segment fetch + AMQP) runs inside a timer callback | Thin **@Process** handler can **fan out** to dedicated queues for heavy or parallel work |
+| Long `executeSchedule` (segment fetch + AMQP) runs inside a timer callback | Thin **Nest Process** handler can **fan out** to dedicated queues for heavy or parallel work |
 | Journey **`next_step_at`** only checked **once per minute**; `isRunning` skips overlapping ticks | **Delayed `add()`** aligns wake-up with `next_step_at`; no global “whole executor” lock for all tenants |
 
 ---
