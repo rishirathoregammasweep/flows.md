@@ -242,9 +242,3 @@ sequenceDiagram
 **Idempotency note:** use a deterministic **`jobId`** (or DB claim row) so a duplicate **`add()`** after retry does not double-send the same step; document the chosen keying in runbooks (see `docs/journey-scheduled-campaign-architecture-changes.md` §4.4 pattern for schedules).
 
 ---
-
-## Related documentation
-
-- `docs/journey-scheduled-campaign-architecture-changes.md` — DB → BullMQ mapping table, queue names, feature flags.
-- `docs/background-jobs-bullmq.md` — Rationale vs Nest `@Cron`.
-- `docs/reliable-background-work-evolution.md` — Broader “scheduler vs executor” pattern.
